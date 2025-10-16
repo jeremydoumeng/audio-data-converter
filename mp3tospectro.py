@@ -8,7 +8,7 @@ import numpy as np
 
 
 class SpectrogramBatchGenerator:
-    """Générateur batch de spectrogrammes et MFCC pour dataset classifié"""
+    """Générateur batch de spectrogrammes, MFCC, Deltas et Deltas-Deltas"""
 
     def __init__(self, sample_rate=16000, n_mels=64, n_fft=1024,
                  hop_length=256, f_min=20, f_max=None, normalize=True,
@@ -97,6 +97,39 @@ class SpectrogramBatchGenerator:
 
         return waveform
 
+    def compute_deltas(self, specgram, win_length=5, mode='replicate'):
+        """
+        Calcule les deltas (dérivées premières) d'un spectrogramme ou MFCC
+
+        Args:
+            specgram: Tensor de forme (n_features, time)
+            win_length: Longueur de la fenêtre pour le calcul des deltas
+            mode: Mode de padding ('replicate', 'reflect', 'constant')
+
+        Returns:
+            Tensor des deltas de même forme que l'entrée
+        """
+        # Créer les coefficients pour le calcul des deltas
+        n = (win_length - 1) // 2
+        denom = n * (n + 1) * (2 * n + 1) / 3
+
+        # Padding
+        specgram_padded = torch.nn.functional.pad(
+            specgram.unsqueeze(0).unsqueeze(0),
+            (n, n, 0, 0),
+            mode=mode
+        ).squeeze(0).squeeze(0)
+
+        # Calcul des deltas
+        deltas = torch.zeros_like(specgram)
+        for t in range(specgram.shape[1]):
+            acc = 0
+            for k in range(-n, n + 1):
+                acc += k * specgram_padded[:, t + n + k]
+            deltas[:, t] = acc / denom
+
+        return deltas
+
     def generate_spectrogram(self, audio_input, duration=None):
         """Génère un mel-spectrogramme"""
         if isinstance(audio_input, (str, Path)):
@@ -134,6 +167,32 @@ class SpectrogramBatchGenerator:
             mfcc = (mfcc - mfcc.mean()) / (mfcc.std() + 1e-8)
 
         return mfcc
+
+    def generate_mfcc_with_deltas(self, audio_input, duration=None, win_length=5):
+        """
+        Génère MFCC avec Deltas et Deltas-Deltas
+
+        Returns:
+            dict avec clés 'mfcc', 'delta', 'delta_delta', 'combined'
+        """
+        # Générer MFCC
+        mfcc = self.generate_mfcc(audio_input, duration)
+
+        # Calculer Deltas
+        delta = self.compute_deltas(mfcc, win_length=win_length)
+
+        # Calculer Deltas-Deltas (deltas des deltas)
+        delta_delta = self.compute_deltas(delta, win_length=win_length)
+
+        # Combiner tout (empilage vertical)
+        combined = torch.cat([mfcc, delta, delta_delta], dim=0)
+
+        return {
+            'mfcc': mfcc,
+            'delta': delta,
+            'delta_delta': delta_delta,
+            'combined': combined
+        }
 
     def save_as_image(self, data, save_path, title, data_type="spectrogram"):
         """Sauvegarde un spectrogramme ou MFCC comme image PNG"""
@@ -174,38 +233,29 @@ def process_dataset(
         input_dir,
         output_dir,
         duration=None,
-        save_format="image",  # "image", "tensor", ou "both"
+        save_format="image",
         sample_rate=16000,
         n_mels=64,
         n_mfcc=20,
-        file_extensions=['.wav']
+        file_extensions=['.wav'],
+        include_deltas=True,
+        delta_on_spectrogram=False
 ):
     """
-    Traite tout le dataset et génère spectrogrammes et MFCC organisés par classe
+    Traite tout le dataset et génère spectrogrammes, MFCC, Deltas et Deltas-Deltas
 
-    Structure entrée:
-        input_dir/
-            dog/
-                audio1.wav
-                audio2.wav
-            cat/
-                audio1.wav
-                audio2.wav
-
-    Structure sortie:
+    Structure sortie (avec include_deltas=True):
         output_dir/
             dog_spectro/
-                audio1.png (ou .pt)
-                audio2.png
             dog_mfcc/
-                audio1.png (ou .pt)
-                audio2.png
+            dog_delta/
+            dog_delta_delta/
+            dog_mfcc_combined/  # MFCC + Delta + Delta-Delta empilés
             cat_spectro/
-                audio1.png
-                audio2.png
             cat_mfcc/
-                audio1.png
-                audio2.png
+            cat_delta/
+            cat_delta_delta/
+            cat_mfcc_combined/
 
     Args:
         input_dir: Dossier contenant les sous-dossiers par classe
@@ -216,9 +266,11 @@ def process_dataset(
         n_mels: Nombre de bandes mel
         n_mfcc: Nombre de coefficients MFCC
         file_extensions: Extensions de fichiers audio à traiter
+        include_deltas: Si True, génère aussi les deltas et deltas-deltas
+        delta_on_spectrogram: Si True, applique aussi les deltas sur le spectrogramme
     """
     print("=" * 80)
-    print("GÉNÉRATION BATCH DE SPECTROGRAMMES ET MFCC")
+    print("GÉNÉRATION BATCH DE SPECTROGRAMMES, MFCC ET DELTAS")
     print("=" * 80)
 
     input_path = Path(input_dir)
@@ -232,8 +284,7 @@ def process_dataset(
         n_mfcc=n_mfcc
     )
 
-
-    # Trouver toutes les classes (sous-dossiers)
+    # Trouver toutes les classes
     class_dirs = [d for d in input_path.iterdir() if d.is_dir()]
 
     if len(class_dirs) == 0:
@@ -250,36 +301,59 @@ def process_dataset(
     for class_dir in class_dirs:
         class_name = class_dir.name
 
-        print(f"\n{'=' * 80}")
-        print(f"Traitement de la classe: {class_name}")
-        print(f"{'=' * 80}")
-
-        # Créer les dossiers de sortie pour cette classe
+        # Créer les dossiers de sortie
         spectro_dir = output_path / f"{class_name}_spectro"
         mfcc_dir = output_path / f"{class_name}_mfcc"
         spectro_dir.mkdir(parents=True, exist_ok=True)
         mfcc_dir.mkdir(parents=True, exist_ok=True)
 
-        # Trouver tous les fichiers audio de cette classe
+        if include_deltas:
+            delta_dir = output_path / f"{class_name}_delta"
+            delta_delta_dir = output_path / f"{class_name}_delta_delta"
+            combined_dir = output_path / f"{class_name}_mfcc_combined"
+            delta_dir.mkdir(parents=True, exist_ok=True)
+            delta_delta_dir.mkdir(parents=True, exist_ok=True)
+            combined_dir.mkdir(parents=True, exist_ok=True)
+
+        if delta_on_spectrogram:
+            spectro_delta_dir = output_path / f"{class_name}_spectro_delta"
+            spectro_delta_delta_dir = output_path / f"{class_name}_spectro_delta_delta"
+            spectro_combined_dir = output_path / f"{class_name}_spectro_combined"
+            spectro_delta_dir.mkdir(parents=True, exist_ok=True)
+            spectro_delta_delta_dir.mkdir(parents=True, exist_ok=True)
+            spectro_combined_dir.mkdir(parents=True, exist_ok=True)
+
+        # Trouver tous les fichiers audio
         audio_files = []
         for ext in file_extensions:
             audio_files.extend(list(class_dir.glob(f"*{ext}")))
 
         total_files += len(audio_files)
 
-        print(f"📊 {len(audio_files)} fichiers audio trouvés")
 
         # Traiter chaque fichier audio
         for audio_file in audio_files:
             try:
-                # Nom de base du fichier (sans extension)
                 base_name = audio_file.stem
 
                 # Générer spectrogramme
                 spectrogram = generator.generate_spectrogram(str(audio_file), duration=duration)
 
-                # Générer MFCC
-                mfcc = generator.generate_mfcc(str(audio_file), duration=duration)
+                # Générer deltas du spectrogramme si demandé
+                if delta_on_spectrogram:
+                    spectro_delta = generator.compute_deltas(spectrogram, win_length=5)
+                    spectro_delta_delta = generator.compute_deltas(spectro_delta, win_length=5)
+                    spectro_combined = torch.cat([spectrogram, spectro_delta, spectro_delta_delta], dim=0)
+
+                # Générer MFCC avec deltas
+                if include_deltas:
+                    mfcc_data = generator.generate_mfcc_with_deltas(str(audio_file), duration=duration)
+                    mfcc = mfcc_data['mfcc']
+                    delta = mfcc_data['delta']
+                    delta_delta = mfcc_data['delta_delta']
+                    combined = mfcc_data['combined']
+                else:
+                    mfcc = generator.generate_mfcc(str(audio_file), duration=duration)
 
                 # Sauvegarder spectrogramme
                 if save_format in ["image", "both"]:
@@ -309,33 +383,70 @@ def process_dataset(
                     mfcc_path = mfcc_dir / f"{base_name}.pt"
                     generator.save_as_tensor(mfcc, mfcc_path)
 
+                # Sauvegarder Deltas et Deltas-Deltas
+                if include_deltas:
+                    if save_format in ["image", "both"]:
+                        delta_path = delta_dir / f"{base_name}.png"
+                        generator.save_as_image(
+                            delta,
+                            delta_path,
+                            f"{class_name} Delta - {base_name}",
+                            "mfcc"
+                        )
+
+                        delta_delta_path = delta_delta_dir / f"{base_name}.png"
+                        generator.save_as_image(
+                            delta_delta,
+                            delta_delta_path,
+                            f"{class_name} Delta-Delta - {base_name}",
+                            "mfcc"
+                        )
+
+                        combined_path = combined_dir / f"{base_name}.png"
+                        generator.save_as_image(
+                            combined,
+                            combined_path,
+                            f"{class_name} MFCC+Deltas - {base_name}",
+                            "mfcc"
+                        )
+
+                    if save_format in ["tensor", "both"]:
+                        delta_path = delta_dir / f"{base_name}.pt"
+                        generator.save_as_tensor(delta, delta_path)
+
+                        delta_delta_path = delta_delta_dir / f"{base_name}.pt"
+                        generator.save_as_tensor(delta_delta, delta_delta_path)
+
+                        combined_path = combined_dir / f"{base_name}.pt"
+                        generator.save_as_tensor(combined, combined_path)
+
                 total_processed += 1
 
             except Exception as e:
-                print(f"\n⚠️  Erreur sur {audio_file.name}: {e}")
                 total_errors += 1
                 continue
-
-        print(f"✓ Classe {class_name} terminée: {len(audio_files)} fichiers")
 
 
     for class_dir in class_dirs:
         class_name = class_dir.name
         print(f"  • {class_name}_spectro/")
         print(f"  • {class_name}_mfcc/")
-
+        if include_deltas:
+            print(f"  • {class_name}_delta/")
+            print(f"  • {class_name}_delta_delta/")
+            print(f"  • {class_name}_mfcc_combined/")
 
 
 # Exemple d'utilisation
 if __name__ == "__main__":
-    # Configuration simple
+    # Configuration avec Deltas et Deltas-Deltas
     process_dataset(
-        input_dir="/Users/jeremy/PycharmProjects/animalaudio/animal noise dataset /Animal-Soundprepros",  # Votre dossier avec dog/, cat/, etc.
-        output_dir="./processed_data",  # Dossier de sortie
-        duration=None,  # 10 secondes par audio (ou None pour tout)
+        input_dir="/Users/jeremy/PycharmProjects/animalaudio/animal noise dataset /Animal-Soundprepros",
+        output_dir="./processed_data",
+        duration=None,
         save_format="image",  # "image", "tensor", ou "both"
         sample_rate=16000,
         n_mels=64,
-        n_mfcc=20
+        n_mfcc=20,
+        include_deltas=True  # Active les deltas et deltas-deltas
     )
-
